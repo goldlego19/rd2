@@ -1,0 +1,18 @@
+{
+  "p_low": 45,
+  "p_high": 97,
+  "lat_ratio": 1.0,
+  "min_count": 120,
+  "trim_low": 25,
+  "trim_high": 75,
+  "calib_len": 750,
+  "fit_low": 10,
+  "fit_high": 90,
+  "alpha": 0.36,
+  "rate_limit": 3.0,
+  "proxy_median_window": 11,
+  "scale_alpha": 0.14,
+  "max_speed": 130,
+  "scale_k": 0.0,
+  "bias_b": 0.0
+}

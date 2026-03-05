@@ -1,2 +1,3 @@
 comma2k19
-csvs
+.venv
+__pycache__/
