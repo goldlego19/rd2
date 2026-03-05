@@ -7,73 +7,81 @@ from tqdm import tqdm
 
 # --- CONFIGURATION ---
 segment_path = "comma2k19/Chunk_3/99c94dc769b5d96e_2018-05-01--08-13-53/30/"
-output_file = "segment_30_fast_vision.csv"
+output_file = "csvs/segment_30_bev_vision.csv"
 fps = 20.0
 frame_skip = 2  
 
-# UPDATED: Added is_nighttime parameter
-def extract_single_segment_vision(segment_path, output_filename, is_nighttime=False):
-    print(f"Loading arrays for segment: {segment_path} | Night Mode: {is_nighttime}")
-    results = []
+def get_bev_matrix(h, w):
+    """
+    Creates a Perspective Transform matrix to 'unwarp' the dashcam view.
+    Adjust these src points if your lane lines aren't perfectly parallel in BEV.
+    """
+    src = np.float32([
+        [w * 0.42, h * 0.55], # Top Left (Horizon)
+        [w * 0.58, h * 0.55], # Top Right (Horizon)
+        [w * 0.95, h * 0.95], # Bottom Right (Near Hood)
+        [w * 0.05, h * 0.95]  # Bottom Left (Near Hood)
+    ])
     
-    # Initialise CLAHE for night mode
+    dst = np.float32([
+        [0, 0],
+        [w, 0],
+        [w, h],
+        [0, h]
+    ])
+    return cv2.getPerspectiveTransform(src, dst)
+
+def extract_single_segment_vision(segment_path, output_filename, is_nighttime=False):
+    print(f"Extracting BEV Vision: {segment_path} | Night Mode: {is_nighttime}")
+    results = []
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if is_nighttime else None
     
     try:
-        # 1. Load Data Arrays
+        # Load Data Arrays
         can_speed = np.load(os.path.join(segment_path, "processed_log/CAN/speed/value")).flatten()
         can_time = np.load(os.path.join(segment_path, "processed_log/CAN/speed/t")).flatten()
         gnss_val = np.load(os.path.join(segment_path, "processed_log/GNSS/live_gnss_qcom/value"))
         gnss_time = np.load(os.path.join(segment_path, "processed_log/GNSS/live_gnss_qcom/t")).flatten()
         frame_times = np.load(os.path.join(segment_path, "global_pose/frame_times")).flatten()
         
-        # 2. Setup Video and ROI
         cap = cv2.VideoCapture(os.path.join(segment_path, "video.hevc"))
-        ret, prev_frame = cap.read()
-        if not ret: 
-            print("Error: Could not read video file.")
-            return
-            
-        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-        h, w = prev_gray.shape
+        ret, first_frame = cap.read()
+        if not ret: return
         
-        # At night, you might eventually want to lower this ROI slightly to focus purely on the headlight beam
-        r_t, r_b, r_l, r_r = int(h*0.55), int(h*0.75), int(w*0.15), int(w*0.85)
-        prev_roi = prev_gray[r_t:r_b, r_l:r_r]
-        
-        # Apply CLAHE to the first frame if in night mode
-        if is_nighttime:
-            prev_roi = clahe.apply(prev_roi)
+        h, w = first_frame.shape[:2]
+        M = get_bev_matrix(h, w)
 
-        # 3. Haversine GPS Calculation
+        def preprocess(frame):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Remove high-frequency sensor noise (crucial for nighttime grain)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            # Warp to Bird's Eye View
+            warped = cv2.warpPerspective(gray, M, (w, h))
+            # Focus on a central strip to avoid noisy roadside objects
+            roi = warped[int(h*0.2):int(h*0.8), int(w*0.3):int(w*0.7)]
+            if is_nighttime:
+                roi = clahe.apply(roi)
+            return roi
+
+        prev_roi = preprocess(first_frame)
+
+        # GPS Calculation
         lats, lons = np.radians(gnss_val[:, 0]), np.radians(gnss_val[:, 1])
-        gps_dist = 6371000.0 * 2 * np.arcsin(np.sqrt(np.sin(np.diff(lats)/2)**2 + np.cos(lats[:-1]) * np.cos(lats[1:]) * np.sin(np.diff(lons)/2)**2))
+        gps_dist = 6371000.0 * 2 * np.arcsin(np.sqrt(np.sin(np.diff(lats)/2)**2 + 
+                   np.cos(lats[:-1]) * np.cos(lats[1:]) * np.sin(np.diff(lons)/2)**2))
         gps_v_ms = gps_dist / np.diff(gnss_time)
 
-        # 4. Frame-by-Frame Optical Flow with TQDM Progress Bar
-        total_frames_to_process = len(range(1, len(frame_times), frame_skip))
-        
-        # Set filtering thresholds based on the time of day
-        upper_flow_limit = 25.0 if is_nighttime else 45.0
-        
-        print("\nProcessing Video...")
-        for i in tqdm(range(1, len(frame_times), frame_skip), total=total_frames_to_process, desc="Optical Flow", unit="frames"):
+        for i in tqdm(range(1, len(frame_times), frame_skip)):
             for _ in range(frame_skip - 1): cap.grab()
             ret, frame = cap.read()
             if not ret: break
             
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            roi = gray[r_t:r_b, r_l:r_r]
-            
-            # Apply CLAHE to current frame if in night mode
-            if is_nighttime:
-                roi = clahe.apply(roi)
-            
-            # Optical Flow Calculation
+            roi = preprocess(frame)
             flow = cv2.calcOpticalFlowFarneback(prev_roi, roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
             
-            # Filter out extreme shifts (headlight glare at night, shadows during the day)
-            valid = flow[..., 1][(flow[..., 1] > 0.5) & (flow[..., 1] < upper_flow_limit)]
+            # Use vertical flow component (y-axis) for forward motion
+            v_movement = flow[..., 1]
+            valid = v_movement[(v_movement > 0.1) & (v_movement < 30.0)]
             shift = np.median(valid) if len(valid) > 0 else 0.0
             
             results.append({
@@ -86,32 +94,22 @@ def extract_single_segment_vision(segment_path, output_filename, is_nighttime=Fa
         cap.release()
         
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Error: {e}")
         return
 
-    # 5. Finalising and Calibrating
-    print("\nApplying Linear Regression Calibration...")
     df = pd.DataFrame(results)
     
-    # Train the model on this specific segment's data
-    model = LinearRegression().fit(df[['pixel_shift']], df['can_v_kmh'])
-    
-    # Apply the formula to convert pixel shift into km/h
+    # Calibration: Use fit_intercept=False to force 0 shift = 0 speed
+    model = LinearRegression(fit_intercept=False).fit(df[['pixel_shift']], df['can_v_kmh'])
     df['Vision_v_kmh'] = model.predict(df[['pixel_shift']])
     
-    # Apply temporal smoothing (more aggressive smoothing for night mode)
-    smoothing_window = 40 if is_nighttime else 20
-    df['Vision_v_kmh'] = df['Vision_v_kmh'].rolling(window=smoothing_window, min_periods=1).mean()
+    # Temporal Smoothing
+    smooth_win = 40 if is_nighttime else 20
+    df['Vision_v_kmh'] = df['Vision_v_kmh'].rolling(window=smooth_win, min_periods=1).mean()
     
-    # 6. Save and print metrics
     df.to_csv(output_filename, index=False)
-    
-    # Quick error check
     mae = (df['Vision_v_kmh'] - df['can_v_kmh']).abs().mean()
-    print(f"\nSuccess! Data exported to {output_filename}")
-    print(f"Self-Calibrated Vision MAE for this segment: {mae:.2f} km/h")
+    print(f"\nBEV Success! MAE: {mae:.2f} km/h")
 
-# Run the script
 if __name__ == "__main__":
-    # Simply flip this to True when running your night segments!
     extract_single_segment_vision(segment_path, output_file, is_nighttime=False)

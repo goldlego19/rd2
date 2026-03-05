@@ -5,7 +5,7 @@ import seaborn as sns
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # 1. Load the data
-df = pd.read_csv('segment_3_fast_vision.csv')
+df = pd.read_csv('csvs/segment_30_bev_vision.csv')
 
 # 2. Calculate Standard Metrics for BOTH sources (vs CAN)
 mae_vis = mean_absolute_error(df['can_v_kmh'], df['Vision_v_kmh'])
